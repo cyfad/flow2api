@@ -58,7 +58,11 @@ class Config:
 
     @property
     def flow_max_retries(self) -> int:
-        return self._config["flow"]["max_retries"]
+        return self._config.get("flow", {}).get("max_retries", 3)
+
+    @property
+    def flow_retry_interval(self) -> float:
+        return self._config.get("flow", {}).get("retry_interval", 1.0)
 
     @property
     def poll_interval(self) -> float:

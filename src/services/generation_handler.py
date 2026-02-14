@@ -822,14 +822,29 @@ class GenerationHandler:
             if stream:
                 yield self._create_stream_chunk("正在生成图片...\n")
 
-            result = await self.flow_client.generate_image(
-                at=token.at,
-                project_id=project_id,
-                prompt=prompt,
-                model_name=model_config["model_name"],
-                aspect_ratio=model_config["aspect_ratio"],
-                image_inputs=image_inputs
-            )
+            if stream:
+                retry_queue = asyncio.Queue()
+                task = asyncio.create_task(self.flow_client.generate_image(
+                    at=token.at,
+                    project_id=project_id,
+                    prompt=prompt,
+                    model_name=model_config["model_name"],
+                    aspect_ratio=model_config["aspect_ratio"],
+                    image_inputs=image_inputs,
+                    retry_queue=retry_queue
+                ))
+                async for chunk in self._iter_retry_notices(task, retry_queue):
+                    yield chunk
+                result = await task
+            else:
+                result = await self.flow_client.generate_image(
+                    at=token.at,
+                    project_id=project_id,
+                    prompt=prompt,
+                    model_name=model_config["model_name"],
+                    aspect_ratio=model_config["aspect_ratio"],
+                    image_inputs=image_inputs
+                )
 
             # 提取URL和mediaId
             media = result.get("media", [])
@@ -847,9 +862,15 @@ class GenerationHandler:
                 if stream:
                     yield self._create_stream_chunk(f"正在放大图片到 {resolution_name}...\n")
 
-                # 4K/2K 图片重试逻辑 - 最多重试3次
-                max_retries = 3
-                for retry_attempt in range(max_retries):
+                # 4K/2K 图片重试逻辑
+                max_retries = config.flow_max_retries
+                if max_retries is None:
+                    max_retries = 3
+                retry_interval = config.flow_retry_interval if config.flow_retry_interval is not None else 1.0
+                retry_interval = max(0.0, retry_interval)
+                attempt = 0
+                while True:
+                    attempt += 1
                     try:
                         # 调用 upsample API
                         encoded_image = await self.flow_client.upsample_image(
@@ -913,20 +934,27 @@ class GenerationHandler:
 
                     except Exception as e:
                         error_str = str(e)
-                        debug_logger.log_error(f"[UPSAMPLE] 放大失败 (尝试 {retry_attempt + 1}/{max_retries}): {error_str}")
+                        total_label = "无限" if max_retries <= 0 else str(max_retries)
+                        debug_logger.log_error(f"[UPSAMPLE] 放大失败 (尝试 {attempt}/{total_label}): {error_str}")
                         
                         # 检查是否是可重试错误（403、reCAPTCHA、超时等）
                         retry_reason = self.flow_client._get_retry_reason(error_str)
-                        if retry_reason and retry_attempt < max_retries - 1:
+                        if retry_reason and (max_retries <= 0 or attempt < max_retries):
                             if stream:
-                                yield self._create_stream_chunk(f"⚠️ 放大遇到{retry_reason}，正在重试 ({retry_attempt + 2}/{max_retries})...\n")
+                                next_attempt = attempt + 1
+                                yield self._create_stream_chunk(
+                                    f"⚠️ 放大遇到{retry_reason}，正在重试 ({next_attempt}/{total_label})...\n"
+                                )
                             # 等待一小段时间后重试
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(retry_interval)
                             continue
                         else:
                             if stream:
                                 yield self._create_stream_chunk(f"⚠️ 放大失败: {error_str}，返回原图...\n")
                             break
+                    # 达到最大重试次数且未成功
+                    if max_retries > 0 and attempt >= max_retries:
+                        break
 
             # 缓存图片 (如果启用)
             local_url = image_url
@@ -1110,16 +1138,33 @@ class GenerationHandler:
             if video_type == "i2v" and start_media_id:
                 if end_media_id:
                     # 有首尾帧
-                    result = await self.flow_client.generate_video_start_end(
-                        at=token.at,
-                        project_id=project_id,
-                        prompt=prompt,
-                        model_key=model_config["model_key"],
-                        aspect_ratio=model_config["aspect_ratio"],
-                        start_media_id=start_media_id,
-                        end_media_id=end_media_id,
-                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
-                    )
+                    if stream:
+                        retry_queue = asyncio.Queue()
+                        task = asyncio.create_task(self.flow_client.generate_video_start_end(
+                            at=token.at,
+                            project_id=project_id,
+                            prompt=prompt,
+                            model_key=model_config["model_key"],
+                            aspect_ratio=model_config["aspect_ratio"],
+                            start_media_id=start_media_id,
+                            end_media_id=end_media_id,
+                            user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE",
+                            retry_queue=retry_queue
+                        ))
+                        async for chunk in self._iter_retry_notices(task, retry_queue):
+                            yield chunk
+                        result = await task
+                    else:
+                        result = await self.flow_client.generate_video_start_end(
+                            at=token.at,
+                            project_id=project_id,
+                            prompt=prompt,
+                            model_key=model_config["model_key"],
+                            aspect_ratio=model_config["aspect_ratio"],
+                            start_media_id=start_media_id,
+                            end_media_id=end_media_id,
+                            user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+                        )
                 else:
                     # 只有首帧 - 需要去掉 model_key 中的 _fl
                     # 情况1: _fl_ 在中间 (如 veo_3_1_i2v_s_fast_fl_ultra_relaxed -> veo_3_1_i2v_s_fast_ultra_relaxed)
@@ -1128,38 +1173,85 @@ class GenerationHandler:
                     if actual_model_key.endswith("_fl"):
                         actual_model_key = actual_model_key[:-3]
                     debug_logger.log_info(f"[I2V] 单帧模式，model_key: {model_config['model_key']} -> {actual_model_key}")
-                    result = await self.flow_client.generate_video_start_image(
-                        at=token.at,
-                        project_id=project_id,
-                        prompt=prompt,
-                        model_key=actual_model_key,
-                        aspect_ratio=model_config["aspect_ratio"],
-                        start_media_id=start_media_id,
-                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
-                    )
+                    if stream:
+                        retry_queue = asyncio.Queue()
+                        task = asyncio.create_task(self.flow_client.generate_video_start_image(
+                            at=token.at,
+                            project_id=project_id,
+                            prompt=prompt,
+                            model_key=actual_model_key,
+                            aspect_ratio=model_config["aspect_ratio"],
+                            start_media_id=start_media_id,
+                            user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE",
+                            retry_queue=retry_queue
+                        ))
+                        async for chunk in self._iter_retry_notices(task, retry_queue):
+                            yield chunk
+                        result = await task
+                    else:
+                        result = await self.flow_client.generate_video_start_image(
+                            at=token.at,
+                            project_id=project_id,
+                            prompt=prompt,
+                            model_key=actual_model_key,
+                            aspect_ratio=model_config["aspect_ratio"],
+                            start_media_id=start_media_id,
+                            user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+                        )
 
             # R2V: 多图生成
             elif video_type == "r2v" and reference_images:
-                result = await self.flow_client.generate_video_reference_images(
-                    at=token.at,
-                    project_id=project_id,
-                    prompt=prompt,
-                    model_key=model_config["model_key"],
-                    aspect_ratio=model_config["aspect_ratio"],
-                    reference_images=reference_images,
-                    user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
-                )
+                if stream:
+                    retry_queue = asyncio.Queue()
+                    task = asyncio.create_task(self.flow_client.generate_video_reference_images(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_key=model_config["model_key"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        reference_images=reference_images,
+                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE",
+                        retry_queue=retry_queue
+                    ))
+                    async for chunk in self._iter_retry_notices(task, retry_queue):
+                        yield chunk
+                    result = await task
+                else:
+                    result = await self.flow_client.generate_video_reference_images(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_key=model_config["model_key"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        reference_images=reference_images,
+                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+                    )
 
             # T2V 或 R2V无图: 纯文本生成
             else:
-                result = await self.flow_client.generate_video_text(
-                    at=token.at,
-                    project_id=project_id,
-                    prompt=prompt,
-                    model_key=model_config["model_key"],
-                    aspect_ratio=model_config["aspect_ratio"],
-                    user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
-                )
+                if stream:
+                    retry_queue = asyncio.Queue()
+                    task = asyncio.create_task(self.flow_client.generate_video_text(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_key=model_config["model_key"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE",
+                        retry_queue=retry_queue
+                    ))
+                    async for chunk in self._iter_retry_notices(task, retry_queue):
+                        yield chunk
+                    result = await task
+                else:
+                    result = await self.flow_client.generate_video_text(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_key=model_config["model_key"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+                    )
 
             # 获取task_id和operations
             operations = result.get("operations", [])
@@ -1258,14 +1350,29 @@ class GenerationHandler:
                         
                         try:
                             # 提交放大任务
-                            upsample_result = await self.flow_client.upsample_video(
-                                at=token.at,
-                                project_id=project_id,
-                                video_media_id=video_media_id,
-                                aspect_ratio=aspect_ratio,
-                                resolution=upsample_config["resolution"],
-                                model_key=upsample_config["model_key"]
-                            )
+                            if stream:
+                                retry_queue = asyncio.Queue()
+                                task = asyncio.create_task(self.flow_client.upsample_video(
+                                    at=token.at,
+                                    project_id=project_id,
+                                    video_media_id=video_media_id,
+                                    aspect_ratio=aspect_ratio,
+                                    resolution=upsample_config["resolution"],
+                                    model_key=upsample_config["model_key"],
+                                    retry_queue=retry_queue
+                                ))
+                                async for chunk in self._iter_retry_notices(task, retry_queue):
+                                    yield chunk
+                                upsample_result = await task
+                            else:
+                                upsample_result = await self.flow_client.upsample_video(
+                                    at=token.at,
+                                    project_id=project_id,
+                                    video_media_id=video_media_id,
+                                    aspect_ratio=aspect_ratio,
+                                    resolution=upsample_config["resolution"],
+                                    model_key=upsample_config["model_key"]
+                                )
                             
                             upsample_operations = upsample_result.get("operations", [])
                             if upsample_operations:
@@ -1365,6 +1472,25 @@ class GenerationHandler:
 
         # 超时
         yield self._create_error_response(f"视频生成超时 (已轮询{max_attempts}次)")
+
+    async def _iter_retry_notices(self, task: asyncio.Task, retry_queue: asyncio.Queue) -> AsyncGenerator[str, None]:
+        if retry_queue is None:
+            return
+
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.1)
+            while True:
+                try:
+                    message = retry_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                yield self._create_stream_chunk(message)
+            if done:
+                break
+
+        while not retry_queue.empty():
+            message = await retry_queue.get()
+            yield self._create_stream_chunk(message)
 
     # ========== 响应格式化 ==========
 

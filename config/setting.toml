@@ -7,6 +7,8 @@ admin_password = "admin"
 labs_base_url = "https://labs.google/fx/api"
 api_base_url = "https://aisandbox-pa.googleapis.com/v1"
 timeout = 120
+max_retries = -1  # 无限重试
+retry_interval = 1.0
 poll_interval = 3.0
 max_poll_attempts = 200
 
@@ -37,6 +39,6 @@ timeout = 7200  # 缓存超时时间(秒), 默认2小时
 base_url = ""   # 缓存文件访问的基础URL, 留空则使用服务器地址
 
 [captcha]
-captcha_method = "browser"  # 打码方式: yescaptcha 或 browser
-yescaptcha_api_key = ""  # YesCaptcha API密钥
+captcha_method = "yescaptcha"  # 打码方式: yescaptcha 或 browser
+yescaptcha_api_key = "806915a4072bf1319050b564aad783029abfc87d96579"  # YesCaptcha API密钥
 yescaptcha_base_url = "https://api.yescaptcha.com"

@@ -470,7 +470,8 @@ class FlowClient:
         prompt: str,
         model_name: str,
         aspect_ratio: str,
-        image_inputs: Optional[List[Dict]] = None
+        image_inputs: Optional[List[Dict]] = None,
+        retry_queue=None
     ) -> dict:
         """生成图片(同步返回)
 
@@ -496,15 +497,27 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/projects/{project_id}/flowMedia:batchGenerateImages"
 
-        # 403/reCAPTCHA 重试逻辑 - 最多重试3次
-        max_retries = 3
+        # 403/reCAPTCHA 重试逻辑
+        max_retries = self._get_max_retries()
         last_error = None
         
-        for retry_attempt in range(max_retries):
+        for attempt in self._iter_retry_attempts(max_retries):
             # 每次重试都重新获取 reCAPTCHA token
             recaptcha_token, browser_id = await self._get_recaptcha_token(project_id, action="IMAGE_GENERATION")
             if not recaptcha_token:
-                raise Exception("Failed to obtain reCAPTCHA token")
+                error_str = "Failed to obtain reCAPTCHA token"
+                last_error = Exception(error_str)
+                retry_reason = self._get_retry_reason(error_str)
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 图片生成遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[IMAGE] 生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
+                    await self._notify_browser_captcha_error(browser_id)
+                    await asyncio.sleep(self._get_retry_interval())
+                    continue
+                raise last_error
             session_id = self._generate_session_id()
 
             # 构建请求 - clientContext 只在外层，requests 内不重复
@@ -544,10 +557,14 @@ class FlowClient:
                 error_str = str(e)
                 last_error = e
                 retry_reason = self._get_retry_reason(error_str)
-                if retry_reason and retry_attempt < max_retries - 1:
-                    debug_logger.log_warning(f"[IMAGE] 生成遇到{retry_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})...")
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 图片生成遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[IMAGE] 生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
                     await self._notify_browser_captcha_error(browser_id)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self._get_retry_interval())
                     continue
                 else:
                     raise e
@@ -617,7 +634,8 @@ class FlowClient:
         prompt: str,
         model_key: str,
         aspect_ratio: str,
-        user_paygate_tier: str = "PAYGATE_TIER_ONE"
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        retry_queue=None
     ) -> dict:
         """文生视频,返回task_id
 
@@ -641,15 +659,27 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoText"
 
-        # 403/reCAPTCHA 重试逻辑 - 最多重试3次
-        max_retries = 3
+        # 403/reCAPTCHA 重试逻辑
+        max_retries = self._get_max_retries()
         last_error = None
         
-        for retry_attempt in range(max_retries):
+        for attempt in self._iter_retry_attempts(max_retries):
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(project_id, action="VIDEO_GENERATION")
             if not recaptcha_token:
-                raise Exception("Failed to obtain reCAPTCHA token")
+                error_str = "Failed to obtain reCAPTCHA token"
+                last_error = Exception(error_str)
+                retry_reason = self._get_retry_reason(error_str)
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 文生视频遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO T2V] 生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
+                    await self._notify_browser_captcha_error(browser_id)
+                    await asyncio.sleep(self._get_retry_interval())
+                    continue
+                raise last_error
             session_id = self._generate_session_id()
             scene_id = str(uuid.uuid4())
 
@@ -690,10 +720,14 @@ class FlowClient:
                 error_str = str(e)
                 last_error = e
                 retry_reason = self._get_retry_reason(error_str)
-                if retry_reason and retry_attempt < max_retries - 1:
-                    debug_logger.log_warning(f"[VIDEO T2V] 生成遇到{retry_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})...")
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 文生视频遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO T2V] 生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
                     await self._notify_browser_captcha_error(browser_id)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self._get_retry_interval())
                     continue
                 else:
                     raise e
@@ -709,7 +743,8 @@ class FlowClient:
         model_key: str,
         aspect_ratio: str,
         reference_images: List[Dict],
-        user_paygate_tier: str = "PAYGATE_TIER_ONE"
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        retry_queue=None
     ) -> dict:
         """图生视频,返回task_id
 
@@ -727,15 +762,27 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoReferenceImages"
 
-        # 403/reCAPTCHA 重试逻辑 - 最多重试3次
-        max_retries = 3
+        # 403/reCAPTCHA 重试逻辑
+        max_retries = self._get_max_retries()
         last_error = None
         
-        for retry_attempt in range(max_retries):
+        for attempt in self._iter_retry_attempts(max_retries):
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(project_id, action="VIDEO_GENERATION")
             if not recaptcha_token:
-                raise Exception("Failed to obtain reCAPTCHA token")
+                error_str = "Failed to obtain reCAPTCHA token"
+                last_error = Exception(error_str)
+                retry_reason = self._get_retry_reason(error_str)
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 图生视频遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO R2V] 生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
+                    await self._notify_browser_captcha_error(browser_id)
+                    await asyncio.sleep(self._get_retry_interval())
+                    continue
+                raise last_error
             session_id = self._generate_session_id()
             scene_id = str(uuid.uuid4())
 
@@ -777,10 +824,14 @@ class FlowClient:
                 error_str = str(e)
                 last_error = e
                 retry_reason = self._get_retry_reason(error_str)
-                if retry_reason and retry_attempt < max_retries - 1:
-                    debug_logger.log_warning(f"[VIDEO R2V] 生成遇到{retry_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})...")
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 图生视频遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO R2V] 生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
                     await self._notify_browser_captcha_error(browser_id)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self._get_retry_interval())
                     continue
                 else:
                     raise e
@@ -797,7 +848,8 @@ class FlowClient:
         aspect_ratio: str,
         start_media_id: str,
         end_media_id: str,
-        user_paygate_tier: str = "PAYGATE_TIER_ONE"
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        retry_queue=None
     ) -> dict:
         """收尾帧生成视频,返回task_id
 
@@ -816,15 +868,27 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoStartAndEndImage"
 
-        # 403/reCAPTCHA 重试逻辑 - 最多重试3次
-        max_retries = 3
+        # 403/reCAPTCHA 重试逻辑
+        max_retries = self._get_max_retries()
         last_error = None
         
-        for retry_attempt in range(max_retries):
+        for attempt in self._iter_retry_attempts(max_retries):
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(project_id, action="VIDEO_GENERATION")
             if not recaptcha_token:
-                raise Exception("Failed to obtain reCAPTCHA token")
+                error_str = "Failed to obtain reCAPTCHA token"
+                last_error = Exception(error_str)
+                retry_reason = self._get_retry_reason(error_str)
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 首尾帧视频生成遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO I2V] 首尾帧生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
+                    await self._notify_browser_captcha_error(browser_id)
+                    await asyncio.sleep(self._get_retry_interval())
+                    continue
+                raise last_error
             session_id = self._generate_session_id()
             scene_id = str(uuid.uuid4())
 
@@ -871,10 +935,14 @@ class FlowClient:
                 error_str = str(e)
                 last_error = e
                 retry_reason = self._get_retry_reason(error_str)
-                if retry_reason and retry_attempt < max_retries - 1:
-                    debug_logger.log_warning(f"[VIDEO I2V] 首尾帧生成遇到{retry_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})...")
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 首尾帧视频生成遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO I2V] 首尾帧生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
                     await self._notify_browser_captcha_error(browser_id)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self._get_retry_interval())
                     continue
                 else:
                     raise e
@@ -890,7 +958,8 @@ class FlowClient:
         model_key: str,
         aspect_ratio: str,
         start_media_id: str,
-        user_paygate_tier: str = "PAYGATE_TIER_ONE"
+        user_paygate_tier: str = "PAYGATE_TIER_ONE",
+        retry_queue=None
     ) -> dict:
         """仅首帧生成视频,返回task_id
 
@@ -908,15 +977,27 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoStartImage"
 
-        # 403/reCAPTCHA 重试逻辑 - 最多重试3次
-        max_retries = 3
+        # 403/reCAPTCHA 重试逻辑
+        max_retries = self._get_max_retries()
         last_error = None
         
-        for retry_attempt in range(max_retries):
+        for attempt in self._iter_retry_attempts(max_retries):
             # 每次重试都重新获取 reCAPTCHA token - 视频使用 VIDEO_GENERATION action
             recaptcha_token, browser_id = await self._get_recaptcha_token(project_id, action="VIDEO_GENERATION")
             if not recaptcha_token:
-                raise Exception("Failed to obtain reCAPTCHA token")
+                error_str = "Failed to obtain reCAPTCHA token"
+                last_error = Exception(error_str)
+                retry_reason = self._get_retry_reason(error_str)
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 首帧视频生成遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO I2V] 首帧生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
+                    await self._notify_browser_captcha_error(browser_id)
+                    await asyncio.sleep(self._get_retry_interval())
+                    continue
+                raise last_error
             session_id = self._generate_session_id()
             scene_id = str(uuid.uuid4())
 
@@ -961,10 +1042,14 @@ class FlowClient:
                 error_str = str(e)
                 last_error = e
                 retry_reason = self._get_retry_reason(error_str)
-                if retry_reason and retry_attempt < max_retries - 1:
-                    debug_logger.log_warning(f"[VIDEO I2V] 首帧生成遇到{retry_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})...")
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 首帧视频生成遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO I2V] 首帧生成遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
                     await self._notify_browser_captcha_error(browser_id)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self._get_retry_interval())
                     continue
                 else:
                     raise e
@@ -981,7 +1066,8 @@ class FlowClient:
         video_media_id: str,
         aspect_ratio: str,
         resolution: str,
-        model_key: str
+        model_key: str,
+        retry_queue=None
     ) -> dict:
         """视频放大到 4K/1080P，返回 task_id
 
@@ -998,14 +1084,26 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/video:batchAsyncGenerateVideoUpsampleVideo"
 
-        # 403/reCAPTCHA 重试逻辑 - 最多重试3次
-        max_retries = 3
+        # 403/reCAPTCHA 重试逻辑
+        max_retries = self._get_max_retries()
         last_error = None
         
-        for retry_attempt in range(max_retries):
+        for attempt in self._iter_retry_attempts(max_retries):
             recaptcha_token, browser_id = await self._get_recaptcha_token(project_id, action="VIDEO_GENERATION")
             if not recaptcha_token:
-                raise Exception("Failed to obtain reCAPTCHA token")
+                error_str = "Failed to obtain reCAPTCHA token"
+                last_error = Exception(error_str)
+                retry_reason = self._get_retry_reason(error_str)
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 视频放大遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO UPSAMPLE] 放大遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
+                    await self._notify_browser_captcha_error(browser_id)
+                    await asyncio.sleep(self._get_retry_interval())
+                    continue
+                raise last_error
             session_id = self._generate_session_id()
             scene_id = str(uuid.uuid4())
 
@@ -1044,10 +1142,14 @@ class FlowClient:
                 error_str = str(e)
                 last_error = e
                 retry_reason = self._get_retry_reason(error_str)
-                if retry_reason and retry_attempt < max_retries - 1:
-                    debug_logger.log_warning(f"[VIDEO UPSAMPLE] 放大遇到{retry_reason}，正在重新获取验证码重试 ({retry_attempt + 2}/{max_retries})...")
+                if self._should_retry(retry_reason, attempt, max_retries):
+                    message = f"⚠️ 视频放大遇到{retry_reason}，正在重试 ({self._format_next_attempt(attempt, max_retries)})...\n"
+                    debug_logger.log_warning(
+                        f"[VIDEO UPSAMPLE] 放大遇到{retry_reason}，正在重新获取验证码重试 ({self._format_next_attempt(attempt, max_retries)})..."
+                    )
+                    await self._enqueue_retry_notice(retry_queue, message)
                     await self._notify_browser_captcha_error(browser_id)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self._get_retry_interval())
                     continue
                 else:
                     raise e
@@ -1116,11 +1218,58 @@ class FlowClient:
 
     # ========== 辅助方法 ==========
 
+    def _get_max_retries(self) -> int:
+        """获取最大重试次数 (<=0 表示无限重试)"""
+        try:
+            return int(config.flow_max_retries)
+        except Exception:
+            return 3
+
+    def _get_retry_interval(self) -> float:
+        """获取重试间隔(秒)"""
+        try:
+            interval = float(config.flow_retry_interval)
+        except Exception:
+            return 1.0
+        return max(0.0, interval)
+
+    async def _enqueue_retry_notice(self, retry_queue, message: str):
+        if retry_queue is None:
+            return
+        try:
+            await retry_queue.put(message)
+        except Exception:
+            pass
+
+    def _iter_retry_attempts(self, max_retries: int):
+        """生成重试次数序列，支持无限重试"""
+        attempt = 0
+        while True:
+            attempt += 1
+            yield attempt
+            if max_retries > 0 and attempt >= max_retries:
+                break
+
+    def _should_retry(self, retry_reason: Optional[str], attempt: int, max_retries: int) -> bool:
+        if not retry_reason:
+            return False
+        if max_retries <= 0:
+            return True
+        return attempt < max_retries
+
+    def _format_retry_total(self, max_retries: int) -> str:
+        return "无限" if max_retries <= 0 else str(max_retries)
+
+    def _format_next_attempt(self, attempt: int, max_retries: int) -> str:
+        return f"{attempt + 1}/{self._format_retry_total(max_retries)}"
+
     def _get_retry_reason(self, error_str: str) -> Optional[str]:
         """判断是否需要重试，返回日志提示内容"""
         error_lower = error_str.lower()
         if "403" in error_lower:
             return "403错误"
+        if "failed to obtain recaptcha token" in error_lower:
+            return "reCAPTCHA 获取失败"
         if "recaptcha evaluation failed" in error_lower:
             return "reCAPTCHA 验证失败"
         if "recaptcha" in error_lower:
