@@ -1268,6 +1268,10 @@ class FlowClient:
         error_lower = error_str.lower()
         if "403" in error_lower:
             return "403错误"
+        if "curl: (16)" in error_lower:
+            return "网络传输错误(curl 16)"
+        if "failed to perform" in error_lower:
+            return "网络请求失败"
         if "failed to obtain recaptcha token" in error_lower:
             return "reCAPTCHA 获取失败"
         if "recaptcha evaluation failed" in error_lower:

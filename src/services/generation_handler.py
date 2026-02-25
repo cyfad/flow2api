@@ -1477,20 +1477,31 @@ class GenerationHandler:
         if retry_queue is None:
             return
 
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=0.1)
+        try:
             while True:
-                try:
-                    message = retry_queue.get_nowait()
-                except asyncio.QueueEmpty:
+                done, _ = await asyncio.wait({task}, timeout=0.1)
+                while True:
+                    try:
+                        message = retry_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    yield self._create_stream_chunk(message)
+                if done:
                     break
-                yield self._create_stream_chunk(message)
-            if done:
-                break
 
-        while not retry_queue.empty():
-            message = await retry_queue.get()
-            yield self._create_stream_chunk(message)
+            while not retry_queue.empty():
+                message = await retry_queue.get()
+                yield self._create_stream_chunk(message)
+        finally:
+            # 客户端断开或上游取消时，确保后台任务被回收，避免 "Task exception was never retrieved"
+            if not task.done():
+                task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
 
     # ========== 响应格式化 ==========
 
